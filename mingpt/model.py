@@ -54,12 +54,14 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.proj = nn.Linear(config.n_embd, config.n_embd)
         # causal mask to ensure that attention is only applied to the left in the input sequence
+        # register_buffer is to create a non-parameter constant, could be addressed by self.mask
+        # torch.tril: make the upper triangle of the matrix zero (diagonal is reversed)
         self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
         self.n_head = config.n_head
 
     def forward(self, x, layer_past=None):
-        B, T, C = x.size()
+        B, T, C = x.size() # T should be equal or less than config.block_size
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -68,9 +70,12 @@ class CausalSelfAttention(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.mask[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_drop(att)
+        print(self.mask.shape)
+        print(T)
+        input()
+        att = att.masked_fill(self.mask[:,:,:T,:T] == 0, float('-inf')) # TODO: T == block_size?
+        att = F.softmax(att, dim=-1) # renorm weighs of each time step (first T of (T, T) is T steps of output, second T is weight for T codes in V)
+        att = self.attn_drop(att) # randomly zero some attentions
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
@@ -83,6 +88,8 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        # mean and var of layer norm is calculated over each dimension of n_embd
+        # y = (x - Ex) / √(Vx + ε) * γ + β, γ and β are learnable variables
         self.ln1 = nn.LayerNorm(config.n_embd)
         self.ln2 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
@@ -94,8 +101,12 @@ class Block(nn.Module):
         )
 
     def forward(self, x):
+        # TODO: the order of ln and attn? ask hongyu maybe
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
+
+        x = self.ln1(x + self.attn(x))
+        x = self.ln2(x + self.mlp(x))
         return x
 
 class GPT(nn.Module):
@@ -105,8 +116,9 @@ class GPT(nn.Module):
         super().__init__()
 
         # input embedding stem
-        self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
-        self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
+        # vocab_size: number of cluster centers
+        self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd) # embed cluster index to vector of size n_embd
+        self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd)) # assign a unique position embd for each block(32 * 32 - 1)
         self.drop = nn.Dropout(config.embd_pdrop)
         # transformer
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
@@ -179,6 +191,7 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         b, t = idx.size()
+        # sequence length is restricted by length of postional embedding
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
 
         # forward the GPT model
@@ -186,8 +199,8 @@ class GPT(nn.Module):
         position_embeddings = self.pos_emb[:, :t, :] # each position maps to a (learnable) vector
         x = self.drop(token_embeddings + position_embeddings)
         x = self.blocks(x)
-        x = self.ln_f(x)
-        logits = self.head(x)
+        x = self.ln_f(x) # layer norm again
+        logits = self.head(x) # project embedding to vocal_size
 
         # if we are given some desired targets also calculate the loss
         loss = None
